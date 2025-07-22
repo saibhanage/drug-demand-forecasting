@@ -1,0 +1,10 @@
+# Python virtual environment
+.venv/
+time-series-end-to-end/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Data folders - Do not commit data files
+data/
