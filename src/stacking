@@ -1,0 +1,104 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import train_test_split, cross_val_predict
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from catboost import CatBoostRegressor
+from xgboost import XGBRegressor
+import matplotlib.pyplot as plt
+import warnings
+
+# --- Configuration ---
+# Define the path to your data file
+DATA_FILE_PATH = Path("data/raw/salesweekly.csv")
+# List of all drug categories available for prediction
+DRUG_CATEGORIES = ['M01AB', 'M01AE', 'N02BA', 'N02BE', 'N05B', 'N05C', 'R03', 'R06']
+
+# --- Helper Functions ---
+def mean_absolute_percentage_error(y_true, y_pred):
+    """
+    Calculates MAPE, handling cases where the true value is zero.
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    # Add a small epsilon to the denominator to avoid division by zero
+    y_true_safe = np.where(y_true == 0, 1e-6, y_true)
+    return np.mean(np.abs((y_true - y_pred) / y_true_safe)) * 100
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # Load the dataset
+    try:
+        df = pd.read_csv(DATA_FILE_PATH)
+    except FileNotFoundError:
+        print(f"Error: The file was not found at {DATA_FILE_PATH}")
+        print("Please ensure the file exists and you are running the script from the project root directory.")
+        exit()
+
+    # Preprocessing
+    df.fillna(0, inplace=True)
+    if 'datum' in df.columns:
+        df['datum'] = pd.to_datetime(df['datum'])
+        # Add time-based features
+        df['month'] = df['datum'].dt.month
+        df['week'] = df['datum'].dt.isocalendar().week
+        df['year'] = df['datum'].dt.year
+
+    print("--- Starting Stacking Model Training for All Drug Categories ---")
+
+    # Loop through each drug category to treat it as the target
+    for target_category in DRUG_CATEGORIES:
+        print(f"\n--- Processing Target: {target_category} ---")
+
+        # 1. Feature and Target Selection
+        # Dynamically select features, excluding the current target and original date
+        features_to_use = [col for col in DRUG_CATEGORIES + ['month', 'week', 'year'] if col != target_category]
+        X = df[features_to_use]
+        y = df[target_category]
+
+        # 2. Split data into training and testing sets
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
+
+        # 3. Define Base Models
+        catboost_model = CatBoostRegressor(iterations=200, learning_rate=0.1, depth=6, loss_function='RMSE', verbose=0, random_state=42)
+        xgb_model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
+        
+        base_models = [('catboost', catboost_model), ('xgb', xgb_model)]
+
+        # 4. Generate Training Data for the Meta-Model (without data leakage)
+        # Use cross-validation to get out-of-fold predictions
+        meta_features = {}
+        for name, model in base_models:
+            # This creates predictions for the training set in a way that prevents overfitting
+            train_preds = cross_val_predict(model, X_train, y_train, cv=5, n_jobs=-1)
+            meta_features[f'{name}_pred'] = train_preds
+        
+        X_meta_train = pd.DataFrame(meta_features)
+
+        # 5. Train Base Models on the full training data to make predictions on the test set
+        X_meta_test_data = {}
+        for name, model in base_models:
+            model.fit(X_train, y_train)
+            test_preds = model.predict(X_test)
+            X_meta_test_data[f'{name}_pred'] = test_preds
+        
+        X_meta_test = pd.DataFrame(X_meta_test_data)
+
+        # 6. Train the Meta-Model
+        meta_model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        meta_model.fit(X_meta_train, y_train)
+
+        # 7. Make Final Predictions and Evaluate
+        final_predictions = meta_model.predict(X_meta_test)
+
+        mse = mean_squared_error(y_test, final_predictions)
+        mae = mean_absolute_error(y_test, final_predictions)
+        mape = mean_absolute_percentage_error(y_test, final_predictions)
+        r2 = r2_score(y_test, final_predictions)
+
+        print(f"Final Stacking Model Evaluation for {target_category}:")
+        print(f"  R-squared (R²): {r2:.4f}")
+        print(f"  Mean Absolute Error (MAE): {mae:.4f}")
+        print(f"  Root Mean Squared Error (RMSE): {np.sqrt(mse):.4f}")
+        print(f"  Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+
